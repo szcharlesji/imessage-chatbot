@@ -16,9 +16,11 @@ const targetIdentifiers = targetIdentifiersString
   .map((id) => id.trim())
   .filter((id) => id !== ""); // Remove empty strings if user adds extra commas
 
-const openaiApiEndpoint = process.env.OPENAI_API_ENDPOINT;
+const openaiApiEndpoint =
+  process.env.OPENAI_API_ENDPOINT ||
+  "https://api.openai.com/v1/chat/completions";
 const openaiApiKey = process.env.OPENAI_API_KEY;
-const llmModel = process.env.LLM_MODEL || "gpt-4";
+const llmModel = process.env.LLM_MODEL || "gpt-4o-mini";
 const systemPrompt = process.env.SYSTEM_PROMPT || "You are a helpful chatbot.";
 const messageContextLimit = parseInt(
   process.env.MESSAGE_CONTEXT_LIMIT || "10",
