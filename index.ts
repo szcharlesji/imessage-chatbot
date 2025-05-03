@@ -8,7 +8,14 @@ config();
 
 // --- Configuration ---
 const dbPath = process.env.DB_PATH?.replace("~", os.homedir());
-const targetChatIdentifier = process.env.TARGET_CHAT_IDENTIFIER;
+// Read the comma-separated list of identifiers
+const targetIdentifiersString = process.env.TARGET_CHAT_IDENTIFIERS || "";
+// Split the string into an array and trim whitespace from each identifier
+const targetIdentifiers = targetIdentifiersString
+  .split(",")
+  .map((id) => id.trim())
+  .filter((id) => id !== ""); // Remove empty strings if user adds extra commas
+
 const openaiApiEndpoint = process.env.OPENAI_API_ENDPOINT;
 const openaiApiKey = process.env.OPENAI_API_KEY;
 const llmModel = process.env.LLM_MODEL || "gpt-4";
@@ -28,27 +35,35 @@ if (!dbPath || !openaiApiEndpoint || !openaiApiKey) {
   );
   process.exit(1);
 }
+if (targetIdentifiers.length === 0) {
+  console.error(
+    "Error: No target identifiers found in TARGET_CHAT_IDENTIFIERS environment variable. Please provide a comma-separated list.",
+  );
+  process.exit(1);
+}
 
 // --- State ---
-let lastProcessedMessageId: number | null = null; // Will be initialized at startup
-let isProcessing = false;
+// Use a Map to store the last processed message ID *for each* chat identifier
+let lastProcessedMessageIds: Map<string, number> = new Map();
+// Global lock might still be useful to prevent the whole check cycle from overlapping if it takes longer than the interval
+let isProcessingCycle = false;
 
 // --- SQLite Database Connection ---
 let db: Database;
 
 // --- Types ---
+// (Keep Message, LLMMessage, RecentChatInfo interfaces as they were)
 interface Message {
   rowid: number;
   text: string | null;
   is_from_me: number;
   date: number;
+  service?: string;
 }
-
 interface LLMMessage {
   role: "system" | "user" | "assistant";
   content: string;
 }
-
 interface RecentChatInfo {
   chat_identifier: string;
   display_name: string | null;
@@ -61,7 +76,7 @@ interface RecentChatInfo {
  * Displays the 5 most recently active chats and their identifiers at startup.
  */
 function displayRecentChats() {
-  // ... (keep this function exactly as it was)
+  // ... (Keep this function exactly as it was) ...
   console.log("\n--- Identifying Recent Chats ---");
   if (!db) {
     console.log("Database connection not available for recent chat lookup.");
@@ -85,7 +100,7 @@ function displayRecentChats() {
 
     if (recentChats.length > 0) {
       console.log(
-        "Last 5 active chats (use the 'Identifier' in your .env file for TARGET_CHAT_IDENTIFIER):",
+        "Last 5 active chats (add desired 'Identifiers' to TARGET_CHAT_IDENTIFIERS in .env):", // Updated help text
       );
       recentChats.forEach((chat, index) => {
         const name = chat.display_name
@@ -105,28 +120,31 @@ function displayRecentChats() {
 }
 
 /**
- * Fetches the most recent messages from the specified chat identifier.
+ * Fetches the most recent iMessages (only) from the specified chat identifier.
  */
 function fetchMessages(chatId: string, limit: number): Message[] {
-  // ... (keep this function exactly as it was)
+  // ... (Keep this function exactly as it was, using chatId parameter) ...
   try {
     const query = db.query<Message, [string, number]>(`
             SELECT
                 m.ROWID as rowid,
                 m.text,
                 m.is_from_me,
-                m.date
+                m.date,
+                m.service
             FROM message m
             JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
             JOIN chat c ON cmj.chat_id = c.ROWID
-            WHERE c.chat_identifier = ?
+            WHERE
+                c.chat_identifier = ?
+                AND m.service = 'iMessage'
             ORDER BY m.date DESC
             LIMIT ?;
         `);
     const messages = query.all(chatId, limit);
-    return messages.reverse(); // Return in chronological order
+    return messages.reverse();
   } catch (error) {
-    console.error("Error fetching messages from database:", error);
+    console.error(`Error fetching iMessages for ${chatId}:`, error); // Log identifier on error
     return [];
   }
 }
@@ -138,7 +156,7 @@ async function sendIMessage(
   recipientIdentifier: string,
   messageText: string,
 ): Promise<void> {
-  // ... (keep this function exactly as it was)
+  // ... (Keep this function exactly as it was, using recipientIdentifier parameter) ...
   console.log(
     `Sending message to buddy ${recipientIdentifier} via iMessage service 1: "${messageText}"`,
   );
@@ -154,15 +172,15 @@ async function sendIMessage(
   try {
     await $`osascript -e ${appleScript}`.quiet();
     console.log(
-      "Message sent successfully via AppleScript (using buddy and service 1).",
+      `Message sent successfully via AppleScript to ${recipientIdentifier}.`, // Log identifier on success
     );
   } catch (error) {
     console.error(
-      "Error sending message via AppleScript (using buddy and service 1):",
+      `Error sending message via AppleScript to ${recipientIdentifier}:`, // Log identifier on error
       error,
     );
     console.error(
-      "Ensure Messages app is running, Automation permissions are granted (e.g., Terminal/Ghostty -> Messages), and the identifier is a valid iMessage contact (phone/email).",
+      "Ensure Messages app is running, Automation permissions are granted, and the identifier is a valid iMessage contact.",
     );
   }
 }
@@ -170,10 +188,16 @@ async function sendIMessage(
 /**
  * Queries the configured OpenAI-compatible LLM API.
  */
-async function queryLLM(messages: LLMMessage[]): Promise<string | null> {
-  // ... (keep this function exactly as it was)
-  console.log(`Querying LLM: ${openaiApiEndpoint} with model ${llmModel}`);
+async function queryLLM(
+  messages: LLMMessage[],
+  chatIdentifier: string,
+): Promise<string | null> {
+  // Added chatIdentifier for logging
+  console.log(
+    `Querying LLM for chat ${chatIdentifier}: ${openaiApiEndpoint} with model ${llmModel}`,
+  );
   try {
+    // ... (Keep fetch logic the same) ...
     const response = await fetch(openaiApiEndpoint, {
       method: "POST",
       headers: {
@@ -190,7 +214,7 @@ async function queryLLM(messages: LLMMessage[]): Promise<string | null> {
     if (!response.ok) {
       const errorBody = await response.text();
       console.error(
-        `LLM API Error: ${response.status} ${response.statusText}`,
+        `LLM API Error for ${chatIdentifier}: ${response.status} ${response.statusText}`, // Log identifier on error
         errorBody,
       );
       return null;
@@ -198,202 +222,197 @@ async function queryLLM(messages: LLMMessage[]): Promise<string | null> {
     const data = await response.json();
     const reply = data.choices?.[0]?.message?.content?.trim();
     if (!reply) {
-      console.error("LLM API Error: No content in response structure", data);
+      console.error(
+        `LLM API Error for ${chatIdentifier}: No content in response structure`,
+        data,
+      ); // Log identifier on error
       return null;
     }
-    console.log("LLM Response received.");
+    console.log(`LLM Response received for ${chatIdentifier}.`); // Log identifier on success
     return reply;
   } catch (error) {
-    console.error("Error calling LLM API:", error);
+    console.error(`Error calling LLM API for ${chatIdentifier}:`, error); // Log identifier on error
     return null;
   }
 }
 
 /**
- * Core function: Checks for new incoming messages (since script start) and triggers response.
+ * Initializes the last processed message ID for all configured target identifiers.
  */
-async function checkAndRespond() {
-  // Skip if target not set OR if lastProcessedMessageId hasn't been initialized yet
-  if (!targetChatIdentifier || lastProcessedMessageId === null) {
-    return;
-  }
+function initializeAllLastMessageIds() {
+  console.log("Initializing message tracking for all target identifiers...");
+  let initializedCount = 0;
+  for (const identifier of targetIdentifiers) {
+    // console.log(`Initializing for ${identifier}...`); // Optional verbose log
+    try {
+      const query = db.query<{ rowid: number }, [string]>(`
+                SELECT m.ROWID as rowid
+                FROM message m
+                JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
+                JOIN chat c ON cmj.chat_id = c.ROWID
+                WHERE
+                    c.chat_identifier = ?
+                    AND m.service = 'iMessage'
+                ORDER BY m.date DESC
+                LIMIT 1;
+            `);
+      const latestMsg = query.get(identifier);
 
-  // Prevent overlapping execution cycles
-  if (isProcessing) {
-    return;
-  }
-  isProcessing = true;
-  // console.log("Checking for new messages..."); // Optional: uncomment for verbose polling log
-
-  try {
-    // Fetch recent messages for context, ensure limit is reasonable
-    const recentMessages = fetchMessages(
-      targetChatIdentifier,
-      messageContextLimit,
-    );
-
-    // If no messages found (unlikely after init), skip
-    if (recentMessages.length === 0) {
-      isProcessing = false;
-      return;
-    }
-
-    // Find the latest *incoming* message that is newer than the last one processed *at startup*
-    let newIncomingMessage: Message | null = null;
-    let latestMessageIdInBatch = 0; // Track the latest ID seen in this batch
-
-    // Iterate backwards from the newest message in the fetched batch
-    for (let i = recentMessages.length - 1; i >= 0; i--) {
-      const msg = recentMessages[i];
-      if (msg.rowid > latestMessageIdInBatch) {
-        latestMessageIdInBatch = msg.rowid; // Update latest seen ID
-      }
-      // Check if it's from the other person AND its ID is strictly greater than the ID recorded at startup
-      if (msg.is_from_me === 0 && msg.rowid > lastProcessedMessageId) {
-        // If we haven't found a newer incoming message yet OR this one is newer than the one found
-        if (
-          newIncomingMessage === null ||
-          msg.rowid > newIncomingMessage.rowid
-        ) {
-          newIncomingMessage = msg;
-          // Don't break here, we want the absolute latest incoming message in the batch
-        }
-      }
-    }
-
-    // If a new incoming message (since startup) was found, process it
-    if (newIncomingMessage) {
-      console.log(
-        `New incoming message detected (ID: ${newIncomingMessage.rowid}, since startup ID: ${lastProcessedMessageId}): "${newIncomingMessage.text}"`,
-      );
-      // IMPORTANT: Update lastProcessedMessageId to the ID of the message we are *responding* to.
-      // This prevents responding to the same message again if multiple arrive between polls.
-      lastProcessedMessageId = newIncomingMessage.rowid;
-
-      // Build the context for the LLM (using the fetched recent messages)
-      const llmContext: LLMMessage[] = [
-        { role: "system", content: systemPrompt },
-      ];
-      recentMessages.forEach((msg) => {
-        if (msg.text && msg.text.trim() !== "" && !msg.text.includes("￼")) {
-          llmContext.push({
-            role: msg.is_from_me ? "assistant" : "user",
-            content: `${msg.is_from_me ? botName : otherUserName}: ${msg.text}`,
-          });
-        }
-      });
-      llmContext.push({
-        role: "user",
-        content: `Based on the conversation above, what should ${botName} say next? Respond with only the message content.`,
-      });
-
-      // Get the response from the LLM
-      const reply = await queryLLM(llmContext);
-
-      // If the LLM provided a valid reply, send it as an iMessage
-      if (reply) {
-        await sendIMessage(targetChatIdentifier, reply);
+      if (latestMsg) {
+        lastProcessedMessageIds.set(identifier, latestMsg.rowid);
+        // console.log(`  -> Initialized ${identifier}. Will ignore messages up to ID: ${latestMsg.rowid}.`); // Optional verbose log
+        initializedCount++;
       } else {
-        console.log("LLM did not provide a reply.");
+        lastProcessedMessageIds.set(identifier, 0); // Start from 0 if no history
+        // console.log(`  -> No existing iMessages found for ${identifier}. Will process first incoming.`); // Optional verbose log
+        initializedCount++;
       }
-    } else {
-      // If no new *incoming* message was found, BUT there were messages in the batch newer than
-      // our lastProcessedMessageId (e.g., outgoing messages), update lastProcessedMessageId
-      // to prevent reprocessing old incoming messages if the script restarts.
-      if (latestMessageIdInBatch > lastProcessedMessageId) {
-        // console.log(`Updating lastProcessedMessageId to ${latestMessageIdInBatch} to track latest message.`); // Optional log
-        lastProcessedMessageId = latestMessageIdInBatch;
-      }
-      // console.log("No new incoming messages since last check."); // Optional log
+    } catch (error) {
+      console.error(
+        `Error initializing last iMessage ID for ${identifier}:`,
+        error,
+      );
+      // Keep map entry undefined/null or set to 0? Let's set to 0 to allow processing.
+      lastProcessedMessageIds.set(identifier, 0);
+      console.error(
+        `  -> Will attempt to process messages from beginning for ${identifier}.`,
+      );
     }
-  } catch (error) {
-    console.error("Error during checkAndRespond cycle:", error);
-  } finally {
-    isProcessing = false;
+  }
+  console.log(
+    `Initialization complete. Tracking ${initializedCount} out of ${targetIdentifiers.length} identifiers.`,
+  );
+  if (initializedCount < targetIdentifiers.length) {
+    console.warn(
+      "Warning: Some identifiers failed initialization. Check errors above.",
+    );
   }
 }
 
 /**
- * Initializes the lastProcessedMessageId by finding the latest message ID at startup.
+ * Core function: Checks all configured chats for new incoming iMessages and triggers responses.
  */
-function initializeLastMessageId() {
-  if (!targetChatIdentifier) {
-    console.log(
-      "Cannot initialize last message ID: TARGET_CHAT_IDENTIFIER not set.",
-    );
+async function checkAndRespondAllChats() {
+  // Prevent the entire cycle from overlapping if it takes too long
+  if (isProcessingCycle) {
+    // console.log("Previous check cycle still running, skipping."); // Optional log
     return;
   }
-  console.log(`Initializing message tracking for ${targetChatIdentifier}...`);
-  try {
-    // Query to get only the ROWID of the single most recent message in the chat
-    const query = db.query<{ rowid: number }, [string]>(`
-            SELECT m.ROWID as rowid
-            FROM message m
-            JOIN chat_message_join cmj ON m.ROWID = cmj.message_id
-            JOIN chat c ON cmj.chat_id = c.ROWID
-            WHERE c.chat_identifier = ?
-            ORDER BY m.date DESC
-            LIMIT 1;
-        `);
-    const latestMsg = query.get(targetChatIdentifier); // Use .get() for single result
+  isProcessingCycle = true;
+  // console.log("Starting check cycle for all chats..."); // Optional log
 
-    if (latestMsg) {
-      lastProcessedMessageId = latestMsg.rowid;
-      console.log(
-        `Initialization complete. Will only process messages newer than ID: ${lastProcessedMessageId}.`,
-      );
-    } else {
-      // If there are absolutely no messages in the chat history
-      lastProcessedMessageId = 0; // Start from beginning (or handle as needed)
-      console.log(
-        `No existing messages found for ${targetChatIdentifier}. Will process first incoming message.`,
-      );
-    }
-  } catch (error) {
-    console.error("Error initializing last message ID:", error);
-    // Decide if you want to exit or try to continue without initialization
-    // For now, we'll allow it to continue, but polling won't work until initialized.
-    lastProcessedMessageId = null;
+  try {
+    // Process each configured identifier sequentially
+    for (const identifier of targetIdentifiers) {
+      const lastId = lastProcessedMessageIds.get(identifier);
+
+      // Skip if initialization failed for this ID (or if set to undefined somehow)
+      if (lastId === undefined) {
+        // console.warn(`Skipping check for ${identifier}: Not initialized.`); // Optional log
+        continue;
+      }
+
+      // --- Logic for a single chat, adapted from previous checkAndRespond ---
+      try {
+        const recentMessages = fetchMessages(identifier, messageContextLimit);
+        if (recentMessages.length === 0) continue; // Skip if no messages for this chat
+
+        let newIncomingMessage: Message | null = null;
+        let latestMessageIdInBatch = lastId; // Start with the last known ID
+
+        for (let i = recentMessages.length - 1; i >= 0; i--) {
+          const msg = recentMessages[i];
+          if (msg.rowid > latestMessageIdInBatch) {
+            latestMessageIdInBatch = msg.rowid;
+          }
+          if (msg.is_from_me === 0 && msg.rowid > lastId) {
+            if (
+              newIncomingMessage === null ||
+              msg.rowid > newIncomingMessage.rowid
+            ) {
+              newIncomingMessage = msg;
+            }
+          }
+        }
+
+        if (newIncomingMessage) {
+          console.log(
+            `[${identifier}] New iMessage detected (ID: ${newIncomingMessage.rowid}, since startup ID: ${lastId}): "${newIncomingMessage.text}"`,
+          );
+          // Update the specific ID for this chat in the map
+          lastProcessedMessageIds.set(identifier, newIncomingMessage.rowid);
+
+          const llmContext: LLMMessage[] = [
+            { role: "system", content: systemPrompt },
+          ];
+          recentMessages.forEach((msg) => {
+            if (msg.text && msg.text.trim() !== "" && !msg.text.includes("￼")) {
+              llmContext.push({
+                role: msg.is_from_me ? "assistant" : "user",
+                content: `${msg.is_from_me ? botName : otherUserName}: ${msg.text}`,
+              });
+            }
+          });
+          llmContext.push({
+            role: "user",
+            content: `Based on the conversation above, what should ${botName} say next? Respond with only the message content.`,
+          });
+
+          const reply = await queryLLM(llmContext, identifier); // Pass identifier for logging
+
+          if (reply) {
+            await sendIMessage(identifier, reply);
+          } else {
+            console.log(`[${identifier}] LLM did not provide a reply.`);
+          }
+        } else {
+          // Update if newer messages (even outgoing) were seen in the batch
+          if (latestMessageIdInBatch > lastId) {
+            // console.log(`[${identifier}] Updating last processed ID to ${latestMessageIdInBatch} (no new incoming).`); // Optional log
+            lastProcessedMessageIds.set(identifier, latestMessageIdInBatch);
+          }
+        }
+      } catch (error) {
+        console.error(`Error processing chat ${identifier}:`, error);
+        // Continue to the next identifier even if one fails
+      }
+      // --- End of logic for a single chat ---
+    } // End loop through identifiers
+  } catch (outerError) {
+    // Catch errors in the main loop setup (less likely)
     console.error(
-      "Polling will be paused until initialization succeeds on next attempt (if applicable).",
+      "Error during the main checkAndRespondAllChats loop:",
+      outerError,
     );
+  } finally {
+    // Release the lock for the entire cycle
+    isProcessingCycle = false;
+    // console.log("Finished check cycle."); // Optional log
   }
 }
 
 // --- Main Execution ---
-
 try {
   console.log(`Attempting to connect to SQLite DB at: ${dbPath}`);
   db = new Database(dbPath, { readonly: true });
   console.log("Successfully connected to SQLite DB.");
 
-  // Display recent chats first
-  displayRecentChats();
+  displayRecentChats(); // Show recent chats to help user
 
-  // *** Initialize the last message ID BEFORE starting the interval ***
-  initializeLastMessageId();
+  // Initialize last message IDs for all configured targets
+  initializeAllLastMessageIds();
 } catch (error) {
   console.error(`Error connecting to SQLite DB at ${dbPath}:`, error);
-  console.error(
-    "Please ensure the path is correct and Bun has permissions (e.g., Full Disk Access for Terminal/Ghostty).",
-  );
+  console.error("Please ensure the path is correct and Bun has permissions.");
   process.exit(1);
 }
 
-// Check if the target identifier is set (it should be for initialization to work)
-if (!targetChatIdentifier) {
-  console.warn("Warning: TARGET_CHAT_IDENTIFIER is not set in your .env file.");
-  console.warn("Please add the correct identifier and restart the script.");
-} else if (lastProcessedMessageId === null) {
-  console.warn(
-    "Warning: Failed to initialize last message ID. Polling may not function correctly.",
-  );
-}
-
+console.log(`Monitoring ${targetIdentifiers.length} chat identifier(s):`);
+targetIdentifiers.forEach((id, index) => console.log(`  ${index + 1}. ${id}`));
 console.log("Starting iMessage Chatbot Server...");
 
-// Set interval; checkAndRespond will now use the initialized lastProcessedMessageId
-setInterval(checkAndRespond, pollIntervalMs);
+// Start the polling interval for checking all chats
+setInterval(checkAndRespondAllChats, pollIntervalMs);
 
 // Basic HTTP server
 const server = Bun.serve({
@@ -401,10 +420,14 @@ const server = Bun.serve({
   fetch(req) {
     const url = new URL(req.url);
     if (url.pathname === "/") {
+      // Generate status string showing monitored IDs
+      const monitoredIds = Array.from(lastProcessedMessageIds.entries())
+        .map(([id, lastMsgId]) => `${id} (since ID ${lastMsgId})`)
+        .join(", ");
       const status =
-        targetChatIdentifier && lastProcessedMessageId !== null
-          ? `Monitoring chat: ${targetChatIdentifier}. Ignoring messages up to ID: ${lastProcessedMessageId}`
-          : "Paused or not initialized.";
+        targetIdentifiers.length > 0
+          ? `Monitoring ${targetIdentifiers.length} chat(s): ${monitoredIds || "Initializing..."}`
+          : "Paused. No target identifiers configured or initialized.";
       return new Response(`iMessage Chatbot running. ${status}`, {
         headers: { "Content-Type": "text/plain" },
       });
@@ -414,13 +437,10 @@ const server = Bun.serve({
 });
 
 console.log(`Bun server listening on http://localhost:${server.port}`);
-if (targetChatIdentifier && lastProcessedMessageId !== null) {
-  console.log(`Polling interval: ${pollIntervalMs / 1000} seconds`);
-}
+console.log(`Polling interval: ${pollIntervalMs / 1000} seconds`);
 
 // Graceful shutdown handler
 process.on("SIGINT", () => {
-  // ... (keep shutdown handler as it was)
   console.log("\nShutting down...");
   if (db) {
     db.close();
